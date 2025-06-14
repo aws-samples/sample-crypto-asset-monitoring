@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Config Rule to detect ACM certificates pending DNS validation (Multi-Region Compatible)'
+
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: The primary region where IAM resources will be created
+  RoleName:
+    Type: String
+    Default: cert-dns-validation-pending-role
+    Description: Name of the IAM role to be created (in primary region only)
+
+Conditions:
+  IsPrimaryRegion: 
+    Fn::Equals: 
+      - Ref: 'AWS::Region'
+      - Ref: PrimaryRegion
+
+Resources:
+  # IAM Role - Only created in the primary region
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: 
+        Ref: RoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertDnsValidationPendingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function - Created in all regions
+  CertDnsValidationPendingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: check-cert-dns-validation-pending
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: 
+        Fn::If: 
+          - IsPrimaryRegion
+          - Fn::GetAtt: [LambdaExecutionRole, Arn]
+          - Fn::Sub: 'arn:aws:iam::${AWS::AccountId}:role/${RoleName}'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          from typing import Dict, List, Any, Optional
+          from datetime import datetime
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              AWS Lambda function to check for certificates pending DNS validation.
+              
+              Args:
+                  event: The event dict from AWS Lambda
+                  context: The context object from AWS Lambda
+                  
+              Returns:
+                  Dict containing the result of the evaluation
+              """
+              logger.info("Starting evaluation for certificates pending DNS validation")
+              
+              try:
+                  evaluations = get_certificate_evaluations(event)
+                  submit_evaluations(evaluations, event['resultToken'])
+                  return {"statusCode": 200, "body": json.dumps({"message": "Evaluation completed successfully"})}
+              except Exception as e:
+                  logger.error(f"Error in lambda_handler: {str(e)}", exc_info=True)
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+          def get_certificate_evaluations(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+              """
+              Evaluate all certificates for pending DNS validation.
+              
+              Args:
+                  event: The event dict from AWS Lambda
+                  
+              Returns:
+                  List of evaluation results for AWS Config
+              """
+              acm = boto3.client('acm')
+              evaluations = []
+              
+              # Use pagination to handle large numbers of certificates
+              paginator = acm.get_paginator('list_certificates')
+              for page in paginator.paginate(CertificateStatuses=['PENDING_VALIDATION']):
+                  for cert_summary in page['CertificateSummaryList']:
+                      cert_arn = cert_summary['CertificateArn']
+                      try:
+                          cert_details = acm.describe_certificate(CertificateArn=cert_arn)
+                          cert = cert_details['Certificate']
+                          
+                          if (cert['Type'] == 'AMAZON_ISSUED' and
+                              cert['Status'] == 'PENDING_VALIDATION' and
+                              cert['DomainValidationOptions'][0]['ValidationMethod'] == 'DNS'):
+                              
+                              evaluations.append({
+                                  'ComplianceResourceType': 'AWS::ACM::Certificate',
+                                  'ComplianceResourceId': cert_arn,
+                                  'ComplianceType': 'NON_COMPLIANT',
+                                  'Annotation': f"Public ACM certificate for {cert['DomainName']} is pending DNS validation",
+                                  'OrderingTimestamp': cert['CreatedAt']
+                              })
+                              logger.info(f"Found non-compliant certificate: {cert_arn}")
+                      except Exception as e:
+                          logger.error(f"Error processing certificate {cert_arn}: {str(e)}")
+              
+              # Default case when no non-compliant resources found
+              if not evaluations:
+                  invokingEvent = json.loads(event['invokingEvent'])
+                  evaluations.append({
+                      'ComplianceResourceType': 'AWS::::Account',
+                      'ComplianceResourceId': event['accountId'],
+                      'ComplianceType': 'COMPLIANT',
+                      'OrderingTimestamp': datetime.fromisoformat(invokingEvent['notificationCreationTime'].replace('Z', '+00:00'))
+                  })
+                  logger.info("No certificates pending DNS validation found")
+              
+              return evaluations
+
+          def submit_evaluations(evaluations: List[Dict[str, Any]], result_token: str) -> None:
+              """
+              Submit evaluation results to AWS Config.
+              
+              Args:
+                  evaluations: List of evaluation results
+                  result_token: The result token from the AWS Config event
+              """
+              config = boto3.client('config')
+              
+              # Submit evaluations in batches of 100 (AWS Config limit)
+              batch_size = 100
+              for i in range(0, len(evaluations), batch_size):
+                  batch = evaluations[i:i + batch_size]
+                  logger.info(f"Submitting batch of {len(batch)} evaluations")
+                  config.put_evaluations(
+                      Evaluations=batch,
+                      ResultToken=result_token
+                  )
+
+  # Lambda Permission - Created in all regions
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: 
+        Fn::GetAtt: [CertDnsValidationPendingLambda, Arn]
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: 
+        Ref: 'AWS::AccountId'
+
+  # Config Rule - Created in all regions
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: LambdaPermission
+    Properties:
+      ConfigRuleName: cert-dns-validation-pending-check
+      Description: "Detects ACM certificates that are pending DNS validation"
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::ACM::Certificate
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: 
+          Fn::GetAtt: [CertDnsValidationPendingLambda, Arn]
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: TwentyFour_Hours
+
+Outputs:
+  ConfigRuleName:
+    Description: The name of the AWS Config Rule
+    Value: 
+      Ref: ConfigRule
+  LambdaFunctionArn:
+    Description: The ARN of the Lambda function
+    Value: 
+      Fn::GetAtt: [CertDnsValidationPendingLambda, Arn]
+  IAMRoleArn:
+    Description: The ARN of the IAM role (only created in primary region)
+    Value: 
+      Fn::If: 
+        - IsPrimaryRegion
+        - Fn::GetAtt: [LambdaExecutionRole, Arn]
+        - Fn::Sub: 'arn:aws:iam::${AWS::AccountId}:role/${RoleName}'
