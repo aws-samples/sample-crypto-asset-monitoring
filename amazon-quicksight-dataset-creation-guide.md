@@ -1,5 +1,5 @@
 # 📊 AWS Crypto Asset Monitoring Datasets
-## 📋 A Guide for Creating Security Data Models with Amazon QuickSight and Amazon Athena
+## 📋 A Guide for Creating Security Datasets with Amazon QuickSight and Amazon Athena
 
 ## 📝 Introduction
 
