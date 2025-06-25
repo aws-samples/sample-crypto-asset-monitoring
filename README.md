@@ -13,6 +13,8 @@ By leveraging AWS CloudTrail, AWS Config, AWS Security Hub, AWS Security Lake, A
 - Examples of interactive dashboards for monitoring and reporting
 - Sample AWS Config rules for detecting unused crypto assets that you can adapt to your needs
 
+For a visual preview of what this solution can provide, check out the sample dashboards for AWS KMS, AWS Certificate Manager, and AWS Secrets Manager in the [Dashboard Creation Guide](amazon-quicksight-dashboard-creation-guide.md#-sample-dashboard-examples).
+
 ## 🧩 2. Solution Components
 
 This example solution consists of the following components that you can customize and extend:
